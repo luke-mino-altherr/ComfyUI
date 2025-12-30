@@ -40,7 +40,9 @@ from app.custom_node_manager import CustomNodeManager
 from app.subgraph_manager import SubgraphManager
 from typing import Optional, Union
 from api_server.routes.internal.internal_routes import InternalRoutes
-from protocol import BinaryEventTypes
+from protocol import BinaryEventTypes, RealtimeMessageTypes
+from realtime_state import RealtimePromptState
+from realtime_protocol import decode_realtime_frame, frame_to_tensor
 
 # Import cache control middleware
 from middleware.cache_middleware import cache_control
@@ -229,6 +231,8 @@ class PromptServer():
         self.app = web.Application(client_max_size=max_upload_size, middlewares=middlewares)
         self.sockets = dict()
         self.sockets_metadata = dict()
+        self.realtime_prompts = dict()  # prompt_id → RealtimePromptState
+        self.pending_prompts = dict()  # prompt_id → prompt_dict (for realtime retrieval)
         self.web_root = (
             FrontendManager.init_frontend(args.front_end_version)
             if args.front_end_root is None
@@ -271,11 +275,15 @@ class PromptServer():
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.ERROR:
                         logging.warning('ws connection closed with exception %s' % ws.exception())
+                    elif msg.type == aiohttp.WSMsgType.BINARY:
+                        await self.handle_binary_frame(sid, msg.data)
                     elif msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             data = json.loads(msg.data)
+                            msg_type = data.get("type")
+
                             # Check if first message is feature flags
-                            if first_message and data.get("type") == "feature_flags":
+                            if first_message and msg_type == "feature_flags":
                                 # Store client feature flags
                                 client_flags = data.get("data", {})
                                 self.sockets_metadata[sid]["feature_flags"] = client_flags
@@ -290,6 +298,9 @@ class PromptServer():
                                 logging.debug(
                                     f"Feature flags negotiated for client {sid}: {client_flags}"
                                 )
+                            elif msg_type == RealtimeMessageTypes.ENABLE_REALTIME:
+                                await self.enable_realtime(sid, data.get("data", {}))
+
                             first_message = False
                         except json.JSONDecodeError:
                             logging.warning(
@@ -300,6 +311,14 @@ class PromptServer():
             finally:
                 self.sockets.pop(sid, None)
                 self.sockets_metadata.pop(sid, None)
+                # Clean up realtime sessions for this client
+                prompts_to_remove = [
+                    pid for pid, state in self.realtime_prompts.items()
+                    if state.client_id == sid
+                ]
+                for pid in prompts_to_remove:
+                    del self.realtime_prompts[pid]
+                    logging.debug(f"Cleaned up realtime session {pid} for client {sid}")
             return ws
 
         @routes.get("/")
@@ -890,6 +909,8 @@ class PromptServer():
                             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
                     extra_data["create_time"] = int(time.time() * 1000)  # timestamp in milliseconds
                     self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+                    # Store prompt for realtime session retrieval
+                    self.pending_prompts[prompt_id] = prompt
                     response = {"prompt_id": prompt_id, "number": number, "node_errors": valid[3]}
                     return web.json_response(response)
                 else:
@@ -973,6 +994,130 @@ class PromptServer():
                     self.prompt_queue.delete_history_item(id_to_delete)
 
             return web.Response(status=200)
+
+    async def enable_realtime(self, client_id: str, data: dict):
+        """Enable realtime mode for a prompt."""
+        prompt_id = data.get("prompt_id")
+        prompt_data = data.get("prompt")  # Client can send the prompt directly
+        
+        if not prompt_id:
+            await self.send(
+                RealtimeMessageTypes.REALTIME_ERROR,
+                {"error": "prompt_id required"},
+                client_id,
+            )
+            return
+
+        state = RealtimePromptState(prompt_id, client_id)
+        
+        # Use prompt from message if provided
+        if prompt_data:
+            state.set_prompt(prompt_data)
+            logging.info(f"[Realtime] Stored prompt from message for session {prompt_id}")
+        # Try pending_prompts first (most reliable for recent prompts)
+        elif prompt_id in self.pending_prompts:
+            state.set_prompt(self.pending_prompts[prompt_id])
+            logging.info(f"[Realtime] Stored prompt from pending_prompts for session {prompt_id}")
+        else:
+            # Try to get the prompt from history
+            history = self.prompt_queue.get_history(prompt_id)
+            if prompt_id in history:
+                # prompt tuple is (number, prompt_id, prompt_dict, extra_data, outputs)
+                prompt_tuple = history[prompt_id].get("prompt")
+                if prompt_tuple and len(prompt_tuple) > 2:
+                    state.set_prompt(prompt_tuple[2])  # prompt_dict is at index 2
+                    logging.info(f"[Realtime] Stored prompt from history for session {prompt_id}")
+                else:
+                    logging.warning(f"[Realtime] Could not extract prompt from history for {prompt_id}")
+            else:
+                logging.warning(f"[Realtime] Prompt {prompt_id} not found in history or pending")
+        
+        self.realtime_prompts[prompt_id] = state
+
+        logging.info(f"[Realtime] Session enabled for prompt {prompt_id} (client {client_id}), has_prompt={state.prompt is not None}")
+
+        await self.send(
+            RealtimeMessageTypes.REALTIME_READY,
+            {"prompt_id": prompt_id},
+            client_id,
+        )
+
+    async def handle_binary_frame(self, client_id: str, data: bytes):
+        """Handle incoming binary frame from WebSocket."""
+        try:
+            frame = decode_realtime_frame(data)
+
+            prompt_id = frame["prompt_id"]
+            node_id = frame["node_id"]
+
+            if prompt_id not in self.realtime_prompts:
+                logging.warning(f"Received frame for unknown realtime session: {prompt_id}")
+                return
+
+            realtime_state = self.realtime_prompts[prompt_id]
+
+            if realtime_state.client_id != client_id:
+                logging.warning(f"Frame from wrong client for session {prompt_id}")
+                return
+
+            tensor = frame_to_tensor(frame)
+            realtime_state.update_frame(node_id, tensor)
+
+            logging.info(
+                f"[Realtime] Frame {frame['frame_num']} received for node {node_id} "
+                f"({frame['width']}x{frame['height']})"
+            )
+
+            # Re-queue the prompt for execution with the new frame
+            if realtime_state.prompt is not None:
+                # Find output nodes (nodes with OUTPUT_NODE=True or sink nodes)
+                prompt = realtime_state.prompt
+                output_nodes = []
+                for node_id, node_data in prompt.items():
+                    class_type = node_data.get("class_type")
+                    if class_type and class_type in nodes.NODE_CLASS_MAPPINGS:
+                        node_class = nodes.NODE_CLASS_MAPPINGS[class_type]
+                        if getattr(node_class, "OUTPUT_NODE", False):
+                            output_nodes.append(node_id)
+                
+                # If no explicit output nodes, find sink nodes (nodes not used as inputs by others)
+                if not output_nodes:
+                    used_as_input = set()
+                    for node_id, node_data in prompt.items():
+                        for input_val in node_data.get("inputs", {}).values():
+                            if isinstance(input_val, list) and len(input_val) == 2:
+                                used_as_input.add(input_val[0])
+                    output_nodes = [nid for nid in prompt.keys() if nid not in used_as_input]
+                
+                # tuple format: (number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive)
+                # Use self.number for unique priority to avoid heapq comparison issues
+                number = self.number
+                self.number += 1
+                
+                # Interrupt if we're on a terminal output node (RealtimeWait, PreviewImage, etc.)
+                # This allows earlier processing nodes to complete before interrupting
+                current_node = realtime_state.current_executing_node
+                interruptible_nodes = {"RealtimeWait", "PreviewImage", "SaveImage"}
+                if current_node is not None and current_node[1] in interruptible_nodes:
+                    nodes.interrupt_processing()
+                    logging.info(f"[Realtime] Interrupted {current_node[1]}, re-queued prompt {prompt_id}")
+                else:
+                    logging.info(f"[Realtime] Queued frame for prompt {prompt_id}, current node: {current_node}")
+                
+                # Use put_realtime to replace any existing queued item for this prompt_id
+                # This prevents queue accumulation when frames arrive faster than execution
+                self.prompt_queue.put_realtime(
+                    (number, prompt_id, prompt, {"client_id": client_id}, output_nodes, {})
+                )
+            else:
+                logging.warning(f"[Realtime] No prompt stored for session {prompt_id}")
+
+        except Exception as e:
+            logging.error(f"Error handling binary frame: {e}")
+
+    def get_realtime_state(self, prompt_id: str) -> RealtimePromptState:
+        """Get the realtime state for a prompt, if it exists."""
+        return self.realtime_prompts.get(prompt_id)
 
     async def setup(self):
         timeout = aiohttp.ClientTimeout(total=None) # no timeout

@@ -2098,7 +2098,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VAEEncodeTiled": "VAE Encode (Tiled)",
 }
 
-EXTENSION_WEB_DIRS = {}
+# Register realtime nodes
+from nodes_realtime import NODE_CLASS_MAPPINGS as REALTIME_NODES
+from nodes_realtime import NODE_DISPLAY_NAME_MAPPINGS as REALTIME_DISPLAY
+NODE_CLASS_MAPPINGS.update(REALTIME_NODES)
+NODE_DISPLAY_NAME_MAPPINGS.update(REALTIME_DISPLAY)
+
+EXTENSION_WEB_DIRS = {
+    "realtime": os.path.join(os.path.dirname(os.path.realpath(__file__)), "web"),
+}
 
 # Dictionary of successfully loaded module names and associated directories.
 LOADED_MODULE_DIRS = {}

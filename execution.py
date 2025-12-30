@@ -415,8 +415,10 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
     inputs = dynprompt.get_node(unique_id)['inputs']
     class_type = dynprompt.get_node(unique_id)['class_type']
     class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
+    # Skip cache for realtime nodes - they need to re-execute with new frames
+    is_realtime = getattr(class_def, 'is_realtime_node', False)
     cached = caches.outputs.get(unique_id)
-    if cached is not None:
+    if cached is not None and not is_realtime:
         if server.client_id is not None:
             cached_ui = cached.ui or {}
             server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": cached_ui.get("output",None), "prompt_id": prompt_id }, server.client_id)
@@ -475,6 +477,26 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
             if obj is None:
                 obj = class_def()
                 caches.objects.set(unique_id, obj)
+
+            # Track currently executing node for realtime sessions
+            realtime_state = server.get_realtime_state(prompt_id)
+            if realtime_state is not None:
+                realtime_state.current_executing_node = (unique_id, class_type)
+
+            # Inject pending realtime frame if this is a realtime node
+            if getattr(class_def, 'is_realtime_node', False):
+                logging.info(f"[Realtime] Executing realtime node {unique_id} ({class_type})")
+                realtime_state = server.get_realtime_state(prompt_id)
+                if realtime_state is not None:
+                    logging.info(f"[Realtime] Found realtime state for prompt {prompt_id}")
+                    pending_frame = realtime_state.get_pending_frame(unique_id)
+                    if pending_frame is not None and hasattr(obj, 'update_frame'):
+                        logging.info(f"[Realtime] Injecting frame into node {unique_id}")
+                        obj.update_frame(pending_frame)
+                    else:
+                        logging.info(f"[Realtime] No pending frame for node {unique_id}")
+                else:
+                    logging.info(f"[Realtime] No realtime state found for prompt {prompt_id}")
 
             if issubclass(class_def, _ComfyNodeInternal):
                 lazy_status_present = first_real_override(class_def, "check_lazy_status") is not None
@@ -686,6 +708,18 @@ class PromptExecutor:
             dynamic_prompt = DynamicPrompt(prompt)
             reset_progress_state(prompt_id, dynamic_prompt)
             add_progress_handler(WebUIProgressHandler(self.server))
+            
+            # Clear cached IS_CHANGED values for realtime nodes to force re-evaluation
+            # This allows IS_CHANGED to return a new timestamp on each execution
+            for node_id, node_data in prompt.items():
+                class_type = node_data.get("class_type")
+                if class_type and class_type in nodes.NODE_CLASS_MAPPINGS:
+                    node_class = nodes.NODE_CLASS_MAPPINGS[class_type]
+                    if getattr(node_class, 'is_realtime_node', False):
+                        if "is_changed" in node_data:
+                            del node_data["is_changed"]
+                            logging.debug(f"[Realtime] Cleared is_changed cache for node {node_id}")
+            
             is_changed_cache = IsChangedCache(prompt_id, dynamic_prompt, self.caches.outputs)
             for cache in self.caches.all:
                 await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
@@ -708,6 +742,8 @@ class PromptExecutor:
             current_outputs = self.caches.outputs.all_node_ids()
             for node_id in list(execute_outputs):
                 execution_list.add_node(node_id)
+
+            logging.info(f"[Execution] Starting execution loop, execute_outputs={execute_outputs}, is_empty={execution_list.is_empty()}")
 
             while not execution_list.is_empty():
                 node_id, error, ex = await execution_list.stage_node_execution()
@@ -1110,6 +1146,29 @@ class PromptQueue:
 
     def put(self, item):
         with self.mutex:
+            heapq.heappush(self.queue, item)
+            self.server.queue_updated()
+            self.not_empty.notify()
+
+    def put_realtime(self, item):
+        """Put a realtime item, replacing any existing queued item with the same prompt_id.
+        
+        This keeps the queue minimal for realtime workflows where only the latest
+        frame matters. If a prompt_id is already queued, replace it instead of adding.
+        """
+        with self.mutex:
+            prompt_id = item[1]
+            
+            # Check if this prompt_id is already in the queue
+            for i, queued_item in enumerate(self.queue):
+                if queued_item[1] == prompt_id:
+                    # Replace the existing item with the new one (update in place)
+                    self.queue[i] = item
+                    heapq.heapify(self.queue)
+                    self.server.queue_updated()
+                    return
+            
+            # Not found, add as new
             heapq.heappush(self.queue, item)
             self.server.queue_updated()
             self.not_empty.notify()

@@ -1,0 +1,32 @@
+{
+  "1": {
+    "class_type": "RealtimeLoadImage",
+    "inputs": {
+      "width": 512,
+      "height": 512
+    }
+  },
+  "2": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": ["1", 0],
+      "width": 1024,
+      "height": 1024,
+      "upscale_method": "lanczos",
+      "crop": "disabled"
+    }
+  },
+  "3": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": ["2", 0]
+    }
+  },
+  "4": {
+    "class_type": "RealtimeWait",
+    "inputs": {
+      "mode": "infinite",
+      "images": ["2", 0]
+    }
+  }
+}
